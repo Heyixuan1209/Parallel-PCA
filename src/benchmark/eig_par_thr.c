@@ -47,7 +47,9 @@ int main(int argc, char **argv) {
 	if (eig_debug_env) eig_debug = atoi(eig_debug_env);
 	jacobi_parallel_set_debug(jacobi_debug);
 
+	MPI_Barrier(MPI_COMM_WORLD);
 	double t0 = pca_wtime();
+	double t_read_start = t0;
 	matrix_t *X = NULL;
 	if (rank == 0 && matrix_read_csv(input, &X) != 0) {
 		fprintf(stderr, "Failed to read %s\n", input);
@@ -55,13 +57,13 @@ int main(int argc, char **argv) {
 	}
 	if (rank == 0) global_n = X->rows;
 
-	double t_read_start = pca_wtime();
 	matrix_t *X_local = NULL;
 	if (matrix_scatter_rows_from_root(X, &X_local, 0, MPI_COMM_WORLD) != 0) {
 		if (rank == 0) fprintf(stderr, "Failed to scatter data\n");
 		if (X) matrix_free(X);
 		MPI_Abort(MPI_COMM_WORLD, 2);
 	}
+	MPI_Barrier(MPI_COMM_WORLD);
 	double t_read = pca_wtime() - t_read_start;
 
 	size_t d = X_local->cols;
@@ -78,8 +80,10 @@ int main(int argc, char **argv) {
 		MPI_Abort(MPI_COMM_WORLD, 2);
 	}
 
+	MPI_Barrier(MPI_COMM_WORLD);
 	double t_center = pca_wtime();
 	matrix_center_columns(X_local, mu);
+	MPI_Barrier(MPI_COMM_WORLD);
 	t_center = pca_wtime() - t_center;
 
 	double *eigvals = (double *)malloc(d * sizeof(double));
@@ -92,6 +96,7 @@ int main(int argc, char **argv) {
 		MPI_Abort(MPI_COMM_WORLD, 2);
 	}
 
+	MPI_Barrier(MPI_COMM_WORLD);
 	double t_pca_start = pca_wtime();
 	int rc = 0;
 	size_t d_cov = X_local->cols;
@@ -139,6 +144,7 @@ int main(int argc, char **argv) {
 		matrix_free(C_local);
 	}
 
+	MPI_Barrier(MPI_COMM_WORLD);
 	double t_pca = pca_wtime() - t_pca_start;
 	if (rc != 0) {
 		if (rank == 0) fprintf(stderr, "root_omp_jacobi failed: %d\n", rc);
@@ -156,17 +162,13 @@ int main(int argc, char **argv) {
 	snprintf(outpath, sizeof(outpath), "%s_rank%02d.csv", outp_prefix, rank);
 	matrix_write_csv(outpath, proj_local);
 
-	double max_read = 0.0, max_center = 0.0, max_pca = 0.0, total_time = 0.0;
-	double local_total = pca_wtime() - t0;
-	MPI_Reduce(&t_read, &max_read, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-	MPI_Reduce(&t_center, &max_center, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-	MPI_Reduce(&t_pca, &max_pca, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-	MPI_Reduce(&local_total, &total_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+	MPI_Barrier(MPI_COMM_WORLD);
+	double total_time = pca_wtime() - t0;
 
 	if (rank == 0) {
 		double explained = pca_explained_ratio_from_eigvals(eigvals, d, k);
 		printf("eig_par[root_omp_jacobi],%zu,%zu,%d,%d,%.6f,%.6f,%.6f,%.6f,%.8f\n",
-			   global_n, d, k, size, max_read, max_center, max_pca, total_time, explained);
+			   global_n, d, k, size, t_read, t_center, t_pca, total_time, explained);
 	}
 
 	if (gather_projection) {

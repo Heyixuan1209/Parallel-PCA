@@ -1,19 +1,15 @@
 # PCA并行计算 课程展示项目
 
-本仓库实现了一个适合并行计算课程展示的 PCA（Principal Component Analysis）项目。代码使用 `C` 语言编写，并结合 `MPI`、`OpenMP`、`BLAS/LAPACK/LAPACKE` 对 PCA 的两条经典数值路线进行实现与比较：
+本仓库实现了一个面向并行计算课程展示的 PCA（Principal Component Analysis）项目，使用 `C` 语言，结合 `MPI`、`OpenMP` 与 `BLAS/LAPACK/LAPACKE`，对两条经典数值路线进行实现与性能比较：
 
 - 基于协方差矩阵特征分解的 PCA
 - 基于奇异值分解（SVD）的 PCA
 
-项目的核心展示重点是：**同一条特征分解路线，在不同并行层次下会呈现怎样的性能差异与工程权衡**。当前仓库包含三种并行特征分解方案：
-
-1. `root_serial_jacobi`
-2. `root_omp_jacobi`
-3. `mpi_jacobi`
-
-此外还包含：
+项目当前包含以下可执行版本：
 
 - `eig_ser`：串行特征分解 PCA
+- `eig_par_pro`：进程级并行 PCA，支持 `root_serial_jacobi` 与 `mpi_jacobi`
+- `eig_par_thr`：线程级并行 PCA，对应 `root_omp_jacobi`
 - `svd_ser`：串行 SVD PCA
 - `svd_par`：并行 SVD PCA
 
@@ -26,15 +22,15 @@ PCA/
 ├─ include/                # 头文件：矩阵、PCA、Jacobi、工具函数接口
 ├─ src/
 │  ├─ core/                # 核心实现：矩阵运算、PCA、Jacobi、MPI辅助函数
-│  └─ benchmark/           # benchmark 入口程序
+│  └─ benchmark/           # 各可执行程序入口
 ├─ data/                   # 数据生成脚本与示例数据
 ├─ scripts/                # 批量测试与绘图脚本
 ├─ results/                # 实验结果输出目录
 ├─ bin/                    # 可执行文件输出目录
-└─ CMakeLists.txt          # CMake 构建配置
+└─ CMakeLists.txt
 ```
 
-推荐重点阅读：
+建议优先阅读：
 
 - `src/core/pca.c`
 - `src/core/jacobi_ser.c`
@@ -48,18 +44,13 @@ PCA/
 
 ## 2. PCA 原理
 
-设中心化后的数据矩阵为：
+设中心化后的数据矩阵为
 
 $$
 X \in \mathbb{R}^{n \times d}
 $$
 
-其中：
-
-- `n` 为样本数
-- `d` 为原始特征维数
-
-PCA 的目标是找到一个低维线性子空间，使得数据投影到该子空间后仍保留尽可能多的方差信息。若取前 `k` 个主方向，则投影结果为：
+其中 `n` 为样本数，`d` 为特征维数。PCA 的目标是找到一个低维正交子空间，使投影后的数据保留尽可能多的方差信息。若取前 `k` 个主方向，则投影结果为
 
 $$
 Y = X V_k
@@ -69,13 +60,13 @@ $$
 
 ### 2.1 基于特征分解的 PCA
 
-先构造协方差矩阵：
+先构造协方差矩阵
 
 $$
 C = \frac{1}{n-1} X^T X
 $$
 
-再做特征分解：
+再做特征分解
 
 $$
 C = V \Lambda V^T
@@ -83,210 +74,114 @@ $$
 
 其中：
 
-- $`\Lambda`$ 的对角元是特征值
+- `\Lambda` 的对角元是特征值
 - `V` 的列向量是特征向量
 
-按特征值从大到小排序后，前 `k` 个特征向量即为 PCA 的主方向。
+按特征值从大到小排序后，前 `k` 个特征向量就是 PCA 的主方向。
 
 ### 2.2 基于 SVD 的 PCA
 
-对中心化矩阵直接做奇异值分解：
+对中心化矩阵直接做奇异值分解
 
 $$
 X = U \Sigma V^T
 $$
 
-则：
+此时：
 
 - `V` 的列向量就是 PCA 主方向
-- $`\Sigma^2 / (n - 1)`$ 与协方差矩阵特征值对应
+- `\Sigma^2 / (n - 1)` 对应协方差矩阵特征值
 
 ---
 
 ## 3. 特征分解路线的三种并行方案
 
-这是本项目最核心的展示内容。
+本项目围绕 Jacobi 特征分解设计了三种并行策略，用于展示“只并行化数据流”到“并行化特征分解核心阶段”的逐步增强过程。当前 Jacobi 实现采用固定配对顺序的循环扫描方式，每轮 sweep 按既定 `(p, q)` 配对推进。
 
 ### 3.1 `root_serial_jacobi`
 
+这是最直接、最稳定的并行基线：`MPI` 负责数据分发、全局均值、中心化、本地协方差汇总与最终投影，特征分解本身仍由 `root` 串行完成。
+
 流程如下：
 
-1. `root` 读取完整数据
-2. 用 `MPI` 按行分发样本
+1. `root` 读取完整数据矩阵
+2. 使用 `MPI` 按行分发样本到各进程
 3. 各进程并行计算全局均值并完成中心化
 4. 各进程计算本地协方差贡献 `C_local`
 5. 使用 `MPI_Reduce` 将协方差矩阵汇总到 `root`
-6. `root` 串行执行 Jacobi 特征分解
+6. `root` 对全局协方差矩阵执行 Jacobi 特征分解
 7. 广播特征值和特征向量
-8. 各进程本地完成投影 `X_local V_k`
+8. 各进程在本地完成投影 `X_local V_k`
 
-这是最清晰、最稳定的并行基线。
+关键调用如下：
+
+```c
+rc = jacobi_eigen_parallel_gather_root_serial(
+    C_local->data, d_cov, eigvals, Vbuf,
+    MPI_COMM_WORLD, 0, jacobi_tol, jacobi_maxiter
+);
+```
+
+这一版本适合作为对照组，用来观察：即便特征分解仍是串行的，仅通过 `MPI` 并行化数据流处理，能获得多少性能收益。
 
 ### 3.2 `root_omp_jacobi`
 
-上一版本的算法中，核心部分Jacobi算法仍然是串行的，这个版本考虑将其并行化。出于最小化改动的原则，我们保留前后 `MPI` 流程不变，仅把第 6 步的 `root` Jacobi 求解替换为 `OpenMP` 版本。
+这一版本保留前后 `MPI` 数据流不变，只把 `root` 上的 Jacobi 求解替换成 `OpenMP` 线程级实现。
 
-#### 设计框架
+整体思路是：
 
-我采用了“**串行控制流 + 计算密集段并行化**”的思路：
+- `MPI` 负责数据分发、均值计算、协方差汇总和投影
+- `OpenMP` 只用于 `root` 进程内部的 Jacobi 迭代更新
 
-1. 外层 Jacobi sweep 仍由串行控制
-2. 每一轮先并行扫描，寻找当前最大非对角元
-3. 旋转参数 `(c, s)` 在串行部分计算
-4. 用 `OpenMP parallel for` 并行更新矩阵中除 `p, q` 外的其余元素
-5. 再用 `OpenMP parallel for` 并行更新特征向量矩阵
+在实现上，外层 sweep 由 `root` 串行控制；每轮先按固定顺序生成当前批次的 `(p, q)` 配对，再由多个线程并行更新矩阵相关行列和特征向量。由于同一轮中的配对互不冲突，这种并行方式能够在不改变整体算法框架的前提下，减少 `root` 上 Jacobi 阶段的耗时。
 
-也就是说，并行化并不是包住整个 Jacobi 算法，而是针对其中最耗时的数组更新部分。
-
-#### 实现要点
-
-在 `src/core/jacobi_par.c` 中，`root_omp_jacobi` 的核心结构可以概括为：
+关键调用如下：
 
 ```c
-for (int iter = 0; iter < maxiter; ++iter) {
-    #pragma omp parallel for reduction(max:max_off)
-    for (...) {
-        // 扫描最大非对角元
-    }
-
-    for (p) {
-        for (q) {
-            // 串行计算旋转参数
-
-            #pragma omp parallel for
-            for (...) {
-                // 并行更新 A 的其他行/列
-            }
-
-            #pragma omp parallel for
-            for (...) {
-                // 并行更新特征向量
-            }
-        }
-    }
-}
+rc = jacobi_eigen_parallel_gather_root_omp(
+    C_local->data, d_cov, eigvals, Vbuf,
+    MPI_COMM_WORLD, 0, jacobi_tol, jacobi_maxiter
+);
 ```
 
-相比在一个大 `parallel` 区域中频繁穿插 `single`、`for`、`barrier` 的写法，这样的结构更容易理解，也更不容易出现同步死锁。
-
-#### 这一版本的意义
-
-它适合回答：
-
-- `root` 成为瓶颈时，线程级并行能否缓解？
-- 共享内存线程并行是否足以胜过纯 `MPI` 的协同分解？
+这一版本适合回答：当瓶颈集中在 `root` 特征分解阶段时，线程级并行是否足以缓解单点计算压力。
 
 ### 3.3 `mpi_jacobi`
 
-这个版本进一步把 Jacobi 本身推进到了进程级并行。
+这一版本进一步把 Jacobi 本身推进到进程级并行。
 
-#### 总体思路
+前半段与前两种方案一致：
 
-前半部分和 `root_serial_jacobi` 相同：
+1. `root` 读取数据并按行分发
+2. 各进程并行完成全局均值、中心化与本地协方差计算
+3. 通过 `MPI_Reduce` 汇总全局协方差矩阵
 
-1. 数据分发
-2. 全局均值计算
-3. 中心化
-4. 本地协方差
-5. `MPI_Reduce` 汇总完整协方差矩阵到 `root`
+随后进入 `MPI` 协同的 Jacobi 阶段：
 
-不同点在于：
+1. `root` 将完整协方差矩阵按行重新分发给各进程
+2. 所有进程按相同的循环配对顺序推进 sweep
+3. 每个进程只更新自己负责的局部矩阵行和局部特征向量行
+4. 每轮结束后通过集合通信同步所需数据
+5. 最终由 `root` 汇总、排序并广播特征值和特征向量
 
-- `root` 不再独占特征分解
-- `root` 拿到完整协方差矩阵后，会将其重新按行块分发给所有进程
-- 每个进程维护自己负责的一段行块
-- Jacobi 旋转由所有进程共同完成
-
-#### 行块分布
-
-当前实现采用**按行块切分矩阵**：
-
-- 每个进程维护若干完整的矩阵行
-- 使用 `row_counts` / `row_displs` 描述分布
-- 对应的局部矩阵存储为按行组织的连续缓冲区
-
-这样做的好处是：
-
-- 容易实现 `Scatterv / Gatherv`
-- 每个进程更新自己负责的行时逻辑清晰
-
-#### 每个旋转对 `(p, q)` 的处理
-
-对于每个旋转对 `(p, q)`：
-
-1. 找到第 `p` 行和第 `q` 行的所有者进程
-2. 拥有者进程取出：
-   - `app`
-   - `aqq`
-   - `apq`
-3. 用 `MPI_Bcast` 将这些标量广播给全部进程
-4. 各进程并行更新自己负责的局部行块中的第 `p`、`q` 列
-5. 用 `MPI_Allgatherv` 汇总旋转后整列数据
-6. 由拥有 `p`、`q` 行的进程恢复对应完整行
-7. 各进程同步更新自己局部的特征向量行块
-
-核心结构可概括为：
+关键调用如下：
 
 ```c
-for (p = 0; p < n - 1; ++p) {
-    for (q = p + 1; q < n; ++q) {
-        // owner_p / owner_q 广播 app, aqq, apq
-        MPI_Bcast(...);
-
-        // 各进程更新本地行块中的第 p, q 列
-        for (local_row ...) {
-            ...
-        }
-
-        // 汇总旋转后的整列
-        MPI_Allgatherv(... col_p ...);
-        MPI_Allgatherv(... col_q ...);
-
-        // 更新局部特征向量
-        for (local_row ...) {
-            ...
-        }
-    }
-}
+rc = jacobi_eigen_parallel_gather(
+    C_local->data, d_cov, eigvals, Vbuf,
+    MPI_COMM_WORLD, 0, jacobi_tol, jacobi_maxiter
+);
 ```
 
-#### 这一版本的意义
-
-它适合展示一个很重要的课程事实：
-
-> 核心数值算法即使理论上可以并行，也不代表工程上就一定更快。
-
-原因在于：
-
-- Jacobi 每一步都强依赖最新矩阵状态
-- 通信与同步非常频繁
-- 当特征维数 `d` 不大时，通信成本可能超过计算收益
-
-因此，`mpi_jacobi` 更适合用来解释“为什么真正并行化特征分解很难”，而不一定总是最快版本。
-
-
-### 3.4 三种方案之间的关系
-
-这三种方案分别代表三种并行层次：
-
-- `root_serial_jacobi`：只并行化数据流，不并行化核心 Jacobi
-- `root_omp_jacobi`：Jacobi 仍在 `root`，但用线程并行优化
-- `mpi_jacobi`：Jacobi 主过程进入 `MPI` 协同求解
-
-因此展示时可以自然比较：
-
-1. 只做数据流并行能得到多少收益？
-2. `OpenMP` 是否能有效缓解 `root` 瓶颈？
-3. 把 Jacobi 推进到纯 `MPI` 后，通信代价是否抵消了理论加速？
-
+这一版本最适合展示：当特征分解主过程也进入 `MPI` 协作后，计算加速和通信开销之间会形成怎样的权衡。
 
 ---
 
-## 4. 仓库使用说明
+## 4. 构建与运行
 
-### 4.1构建环境
+### 4.1 依赖环境
 
-推荐在 **Linux / WSL** 环境中构建和运行，依赖包括：
+推荐在 `Linux / WSL` 环境中构建和运行，依赖包括：
 
 - `gcc` / `mpicc`
 - `cmake`
@@ -298,7 +193,7 @@ for (p = 0; p < n - 1; ++p) {
 - `python3`
 - `matplotlib`
 
-构建方法为
+### 4.2 构建
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -307,17 +202,15 @@ cmake --build build -- -j
 
 生成的主要可执行文件：
 
-```text
-bin/pca_eig_ser
-bin/pca_eig_par_pro
-bin/pca_eig_par_thr
-bin/pca_svd_ser
-bin/pca_svd_par
-```
+- `bin/pca_eig_ser`
+- `bin/pca_eig_par_pro`
+- `bin/pca_eig_par_thr`
+- `bin/pca_svd_ser`
+- `bin/pca_svd_par`
 
-### 4.2 单独运行方法
+### 4.3 单一脚本运行示例
 
-### 4.2.1 生成测试数据
+生成测试数据：
 
 ```bash
 python3 data/generate_data.py \
@@ -329,13 +222,13 @@ python3 data/generate_data.py \
   --out data/synthetic.csv
 ```
 
-### 4.2.2 串行特征分解 PCA
+串行特征分解 PCA
 
 ```bash
 ./bin/pca_eig_ser data/synthetic.csv 10 results/eig_ser_k10.csv
 ```
 
-### 4.2.3 并行特征分解 PCA：`root_serial_jacobi`
+并行特征分解 PCA：`root_serial_jacobi`
 
 ```bash
 mpirun -np 4 ./bin/pca_eig_par_pro \
@@ -345,7 +238,7 @@ mpirun -np 4 ./bin/pca_eig_par_pro \
   root_serial_jacobi
 ```
 
-### 4.2.4 并行特征分解 PCA：`root_omp_jacobi`
+并行特征分解 PCA：`root_omp_jacobi`
 
 ```bash
 OMP_NUM_THREADS=4 \
@@ -356,7 +249,7 @@ mpirun -np 4 ./bin/pca_eig_par_thr \
   results/eig_par_root_omp_k10
 ```
 
-### 4.2.5 并行特征分解 PCA：`mpi_jacobi`
+并行特征分解 PCA：`mpi_jacobi`
 
 ```bash
 mpirun -np 4 ./bin/pca_eig_par_pro \
@@ -366,7 +259,7 @@ mpirun -np 4 ./bin/pca_eig_par_pro \
   mpi_jacobi
 ```
 
-### 4.2.6 串行 / 并行 SVD
+串行 / 并行 SVD
 
 ```bash
 ./bin/pca_svd_ser data/synthetic.csv 10 results/svd_ser_k10.csv
@@ -375,7 +268,7 @@ mpirun -np 4 ./bin/pca_svd_par data/synthetic.csv 10 results/svd_par_k10
 
 ---
 
-### 4.3批量运行方法
+### 4.4批量运行方法
 
  一键运行 benchmark
 
@@ -383,17 +276,6 @@ mpirun -np 4 ./bin/pca_svd_par data/synthetic.csv 10 results/svd_par_k10
 bash scripts/run_benchmarks.sh
 ```
 
-默认脚本会：
-
-1. 构建项目
-2. 生成合成数据
-3. 运行 `eig_ser`、`svd_ser`
-4. 运行 `eig_par_pro` 的两种模式：
-   - `root_serial_jacobi`
-   - `mpi_jacobi`
-5. 运行 `eig_par_thr`（`root_omp_jacobi`）
-6. 运行 `svd_par`
-7. 自动生成 `CSV` 与绘图
 
 默认关键环境变量：
 
@@ -425,50 +307,18 @@ bash scripts/run_benchmarks.sh
 
 ---
 
-## 5. 绘图与结果解释
 
-`scripts/plot.py` 会根据 `results/benchmarks.csv` 自动生成：
+## 5. 局限与后续扩展
 
-- `results/benchmark_summary.png`
-- `results/benchmark_speedup.png`
+当前实现适合课程展示与性能对比，但仍有一些明确边界：
 
-图中会区分：
-
-- `eig_par[root_serial_jacobi]`
-- `eig_par[root_omp_jacobi]`
-- `eig_par[mpi_jacobi]`
-- `svd_par`
-
-每张图适合回答的问题包括：
-
-1. `explained variance ratio` 是否一致
-2. `k` 增大后投影开销是否明显上升
-3. 哪种并行方案随进程数增长更稳定
-4. `root_omp_jacobi` 与 `mpi_jacobi` 谁更适合当前机器规模
-
----
-
-## 6. 当前实现的局限性
-
-当前仓库非常适合课程展示，但仍有明确边界：
-
-- `root_serial_jacobi` 本质上仍是 `root` 求解
-- `root_omp_jacobi` 只是把 `root` 求解器替换为线程并行
-- `mpi_jacobi` 虽然把 Jacobi 主过程扩展到了多个进程，但仍从 `root` 聚合完整协方差矩阵开始，且进程间通信开销过大
+- `root_serial_jacobi` 的特征分解仍受 `root` 单点限制
+- `root_omp_jacobi` 只缓解了 `root` 内部计算，不能消除单点瓶颈
+- `mpi_jacobi` 虽然把 Jacobi 推进到进程级并行，但同步与通信成本较高
 - `svd_par` 仍然依赖 `root` 完成最终 SVD
 
-因此，这个项目更准确地说是：
+如果需要进一步扩展，可以考虑：
 
-> 一个面向课程展示的、逐步增强并行程度的 PCA 实验框架。
-
----
-
-## 7. 后续扩展方向
-
-如果希望继续深入，可以考虑：
-
-1. 实现完全分布式的对称特征分解，即不考虑汇总全局协方差矩阵，直接由多个进程执行Jacobi迭代
-2. 引入 `ScaLAPACK` / `Elemental` 实现分布式 SVD
-3. 扩展实验分析部分，例如增加并行效率（efficiency）指标、增加重构误差与数值稳定性分析、比较不同 `n`、`d` 下瓶颈如何转移
-
-
+- 引入更成熟的分布式特征分解 / SVD 库
+- 增加效率、加速比、重构误差等分析指标
+- 扩展不同 `n / d / k` 组合下的实验矩阵与结果对比
